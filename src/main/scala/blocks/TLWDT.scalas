@@ -1,0 +1,128 @@
+// See LICENSE.SiFive for license details.
+
+package hni.blocks.tlwdt
+
+import Chisel._
+import freechips.rocketchip.config.Parameters
+import freechips.rocketchip.regmapper._
+import hni.blocks.devices.wdarray._
+
+import freechips.rocketchip.config.Field
+import freechips.rocketchip.diplomacy._
+import freechips.rocketchip.subsystem.BaseSubsystem
+
+import freechips.rocketchip.config.Parameters
+import freechips.rocketchip.interrupts._
+import freechips.rocketchip.regmapper._
+import freechips.rocketchip.tilelink._
+import freechips.rocketchip.util._
+
+case class TLWDTParams(regWidth: Int, address: BigInt)
+{
+  def wdogOffset: Int = 0x0
+  def wdogControllers: Int = 4
+  def wdogOutputs : Int = 4
+}
+class TLWDIO(n : Int) extends Bundle {
+  val rst = Vec(n,Bool(OUTPUT))
+}
+
+trait TLWDTBundle
+{
+  val params: TLWDTParams
+  val c = params
+  //val wdog_rst = Bool(OUTPUT)
+
+  // Wdog MUX
+  val wdog = new TLWDIO(c.wdogControllers)
+}
+
+trait TLWDTModule extends HasRegMap
+{
+  val params: TLWDTParams
+  val io: TLWDTBundle
+  val interrupts: Vec[Bool]
+  val c = params
+  //val state = RegInit(UInt(0, width = params.num))
+  //val pending = RegInit(UInt(0xf, width = 4))
+
+  //io.gpio := state
+  ///interrupts := pending.toBools
+
+  val wdog = Module(new WatchdogArray(c.wdogControllers,c.wdogOutputs ,c.wdogOffset))
+  //io.wdog_rst := wdog.io.outputs(0)
+  for(i<- 0 until c.wdogControllers){
+    io.wdog.rst(i) := wdog.io.outputs(i)
+  }
+  wdog.io.corerst := false.B  // has to be false or true???
+  interrupts := wdog.io.interrupts
+
+  regmap(
+    (WatchdogArray.arrRegMap(wdog,c.wdogOffset,4,c.wdogControllers, 40) :_*)
+  )
+}
+
+// Create a concrete TL2 version of the abstract Example slave
+class TLWDT( w:Int, params: TLWDTParams)(implicit p: Parameters)
+  extends TLRegisterRouter(params.address, "wdogarray", Seq("hni,WatchdogArray"), interrupts = params.wdogControllers , beatBytes = w, concurrency = 1)(
+  new TLRegBundle(params, _)    with TLWDTBundle)(
+  new TLRegModule(params, _, _) with TLWDTModule)
+
+
+
+case class TLWDTAttachParams(
+  tlwdt: TLWDTParams,
+  controlBus: TLBusWrapper,
+  intNode: IntInwardNode,
+  mclock: Option[ModuleValue[Clock]] = None,
+  mreset: Option[ModuleValue[Bool]] = None,
+  controlXType: ClockCrossingType = NoCrossing,
+  intXType: ClockCrossingType = NoCrossing)
+  (implicit val p: Parameters)
+
+object TLWDT {
+  val nextId = { var i = -1; () => { i += 1; i} }
+
+  def attach(params: TLWDTAttachParams): TLWDT = {
+    implicit val p = params.p
+    val name = s"wdtarray_${nextId()}"
+    val cbus = params.controlBus
+    val tlwdt = LazyModule(new TLWDT(cbus.beatBytes, params.tlwdt))
+    tlwdt.suggestName(name)
+    cbus.coupleTo(s"device_named_$name") {
+      tlwdt.controlXing(params.controlXType) := TLFragmenter(cbus.beatBytes, cbus.blockBytes) := _
+    }
+    params.intNode := tlwdt.intXing(params.intXType)
+    InModuleBody { tlwdt.module.clock := params.mclock.map(_.getWrappedValue).getOrElse(cbus.module.clock) }
+    InModuleBody { tlwdt.module.reset := params.mreset.map(_.getWrappedValue).getOrElse(cbus.module.reset) }
+
+    tlwdt
+  }
+
+  def attachAndMakePort(params: TLWDTAttachParams): ModuleValue[TLWDIO] = {
+    val tlwdt = attach(params)
+    val tlwdtNode = tlwdt.ioNode.makeSink()(params.p)
+    InModuleBody { tlwdtNode.makeIO()(ValName(tlwdt.name)) }
+  }
+}
+
+
+case object PeripheryTLWDTKey extends Field[Seq[WDTParams]]
+
+trait HasPeripheryWDT { this: BaseSubsystem =>
+  val tlwdtNodes = p(PeripheryTLWDTKey).map { ps => TLWDT.attach(TLWDTAttachParams(ps, pbus, ibus.fromAsync)).ioNode.makeSink }
+}
+
+trait HasPeripheryWDTBundle {
+  val wdt: Seq[TLWDIO]
+}
+
+trait HasPeripheryWDTModuleImp extends LazyModuleImp with HasPeripheryWDTBundle {
+  val outer: HasPeripheryWDT
+  val wdt  = outer.tlwdtNodes.zipWithIndex.map  { case(n,i) => n.makeIO()(ValName(s"tlwdt_$i")) }
+}
+
+// command: java -jar rocket-chip/sbt-launch.jar ++2.12.4 "runMain sifive.blocks.devices.mockaon.mWatchdog"
+object tlwdarray extends App {
+  chisel3.Driver.execute(Array("--target-dir", "generated/Checksum"), () => new TLWDT( 4, new TLWDTParams(4, 0x1000) ))
+}
