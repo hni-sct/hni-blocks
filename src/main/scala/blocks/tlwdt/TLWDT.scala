@@ -1,21 +1,15 @@
-// See LICENSE.SiFive for license details.
-
 package hni.blocks.wdt
 
-//import Chisel._
 import hni.blocks.devices.watchdog._
 
 import Chisel._
-//import chisel3.util._
-//import chisel3.experimental.{IntParam, BaseModule, withClock}
 import freechips.rocketchip.amba.axi4._
 import freechips.rocketchip.subsystem.BaseSubsystem
 import freechips.rocketchip.subsystem._
 import freechips.rocketchip.config.{Parameters, Field, Config}
 import freechips.rocketchip.diplomacy._
-import freechips.rocketchip.regmapper.{HasRegMap}//, RegField
+import freechips.rocketchip.regmapper.{HasRegMap}
 import freechips.rocketchip.tilelink._
-//import freechips.rocketchip.devices.tilelink.CanHavePeripheryCLINT
 import freechips.rocketchip.interrupts._
 import freechips.rocketchip.util._
 import chisel3.experimental.withClock
@@ -41,9 +35,7 @@ trait WDTBundle
 {
   val params: WDTParams
   val c = params
-  //val wdog_rst = Bool(OUTPUT)
 
-  // Wdog MUX
   val wdog = new WDIO(c.Dogs)
 }
 
@@ -80,7 +72,7 @@ class TLWDT( params: WDTParams, beatBytes:Int)(implicit p: Parameters)
   interrupts = params.Ints,
   concurrency = 1)(
   new TLRegBundle(params, _)    with WDTBundle)(
-  new TLRegModule(params, _, _) with WDTModule) //with HasInterruptSources
+  new TLRegModule(params, _, _) with WDTModule) 
 
 class AXI4WDT(params: WDTParams, beatBytes: Int)(implicit p: Parameters)
   extends AXI4RegisterRouter(
@@ -97,19 +89,20 @@ trait CanHavePeripheryWDT
   private val portName = "wdogarray"
 
   val crossing = LazyModule(new TLAsyncCrossingSink(AsyncQueueParams.singleton()))
+  var tlaxi4 : Option[TLToAXI4] = None
   val wdt = p(WDTKey) match {
     case Some(params) => {
       if (params.useAXI4) {
+        tlaxi4 = Some(LazyModule(new TLToAXI4()))
         val wdt = LazyModule(new AXI4WDT(params, pbus.beatBytes)(p))
         pbus.toSlave(Some(portName)) {
           wdt.node :=
-          AXI4Buffer () :=
-          TLToAXI4 () :=
+          AXI4Buffer() :=
+          tlaxi4.get.node :=
           crossing.node :=
           TLAsyncCrossingSource() :=
           // toVariableWidthSlave doesn't use holdFirstDeny, which TLToAXI4() needsx
           TLFragmenter(pbus.beatBytes, pbus.blockBytes, holdFirstDeny = true)
-          
         }
         ibus.fromSync := IntSyncCrossingSink() := IntSyncCrossingSource(alreadyRegistered = true)  := wdt.intnode // Ibus -> Connecting to Interruptsystem
         Some(wdt)
@@ -132,35 +125,8 @@ trait CanHavePeripheryWDTList
     case Some(params) => {
       Some(
         params.map{ ps =>
-          /*if(ps.useAXI4){
-            TLWDT.attachAXI4(ps, p, pbus, ibus)
-          }else{
-            TLWDT.attachTL(ps, p, pbus, ibus)
-          }*/
           TLWDT.attach(ps, p, pbus, ibus)
       })
-      /*val crossing = LazyModule(new TLAsyncCrossingSink(AsyncQueueParams.singleton()))
-      if (params.useAXI4) {
-        val wdt = LazyModule(new AXI4WDT(params, pbus.beatBytes)(p))
-        pbus.toSlave(Some(portName)) {
-          wdt.node :=
-          AXI4Buffer () :=
-          TLToAXI4 () :=
-          crossing.node :=
-          TLAsyncCrossingSource() :=
-          // toVariableWidthSlave doesn't use holdFirstDeny, which TLToAXI4() needsx
-          TLFragmenter(pbus.beatBytes, pbus.blockBytes, holdFirstDeny = true)
-          
-        }
-        ibus.fromSync := IntSyncCrossingSink() := IntSyncCrossingSource(alreadyRegistered = true)  := wdt.intnode // Ibus -> Connecting to Interruptsystem
-        Some(wdt)
-      } else {
-        val wdt = LazyModule(new TLWDT(params, pbus.beatBytes)(p))
-        val node = wdt.node := crossing.node 
-        pbus.toVariableWidthSlave(Some(portName)) { node := TLAsyncCrossingSource() }  // Pbus -> Connecting to PeripherialBus // sbus -> Systembus
-        ibus.fromSync := IntSyncCrossingSink() := IntSyncCrossingSource(alreadyRegistered = true)  := wdt.intnode // Ibus -> Connecting to Interruptsystem
-        Some(wdt)
-      }*/
     }
     case None => None
   }
@@ -169,13 +135,16 @@ trait CanHavePeripheryWDTList
 trait CanHavePeripheryWDTModuleImp extends LazyModuleImp {
   val outer: CanHavePeripheryWDT
   
-  val wdt_out = outer.wdt match {
+  val wdt_io = outer.wdt match {
     case Some(wdt) => {
       val c = wdt.module.params
       val wdog = IO(new WDIO( c.Resets ))
       wdog.outputs := wdt.module.io.wdog.outputs
       wdt.module.io.wdog.clock := wdog.clock
       outer.crossing.module.clock := wdog.clock
+      if(outer.tlaxi4 != None){
+        outer.tlaxi4.get.module.clock := wdog.clock
+      }
       Some(wdog)
     }
     case None => None
@@ -185,19 +154,18 @@ trait CanHavePeripheryWDTModuleImp extends LazyModuleImp {
 trait CanHavePeripheryWDTListModuleImp extends LazyModuleImp {
   val outer: CanHavePeripheryWDTList
   
-  val wdt_out = outer.wdt match {
-    case Some(wdt) => {
-      
-      Some(wdt.map{ case (tmod: Either[TLWDT, AXI4WDT], crossing: TLAsyncCrossingSink) =>
-
+  val wdt_io = outer.wdt match {
+    case Some(wdt) => { 
+      Some(wdt.map{ case (tmod: Either[TLWDT, (AXI4WDT, TLToAXI4)], crossing: TLAsyncCrossingSink) =>
         tmod match{
-          case Right(mod) =>{
+          case Right((mod, toaxi4)) =>{
             val c = mod.module.params
             val wdog = IO(new WDIO( c.Resets ))
 
             wdog.outputs := mod.module.io.wdog.outputs
             mod.module.io.wdog.clock := wdog.clock
             crossing.module.clock := wdog.clock
+            toaxi4.module.clock := wdog.clock
             wdog
           }
           case Left(mod) =>{
@@ -210,49 +178,35 @@ trait CanHavePeripheryWDTListModuleImp extends LazyModuleImp {
             wdog
           }
         }
-
       })
-      
     }
     case None => None
   }
 }
 
-class WithWDT(address: BigInt = 0x2000, regBytes: Int = 4, useAXI4: Boolean = false,
-              Dogs : Int = 4, Resets : Int = 4, Ints : Int = 3, 
-              Mode : hniWatchdogTimer.Modes = hniWatchdogTimer.both, countWidth : Int = 31, cmpWidth : Int = 16, PulseWidth : Int = 32,
-              PRBS : Boolean = false, PRBS_Set : Set[Int] = Set(31,28), Key : Int = 0x51F15E) 
-  extends Config((site, here, up) => {
-  case WDTKey => Some(WDTParams(address = address, regBytes = regBytes, useAXI4 = useAXI4,
-                                Dogs = Dogs, Resets = Resets, Ints = Ints, 
-                                Mode = Mode, countWidth = countWidth, cmpWidth = cmpWidth, PulseWidth = PulseWidth,
-                                PRBS = PRBS, PRBS_Set = PRBS_Set, Key = Key ))
-})
-
 object TLWDT {
   val nextId = { var i = -1; () => { i += 1; i} }
-  //val portName = "wdogarray"
 
-  def attach(params: WDTParams, parameter: Parameters, pBus: PeripheryBus, iBus: InterruptBusWrapper) : (Either[TLWDT, AXI4WDT],TLAsyncCrossingSink) = {
+  def attach(params: WDTParams, parameter: Parameters, pBus: PeripheryBus, iBus: InterruptBusWrapper) : (Either[TLWDT, (AXI4WDT, TLToAXI4)],TLAsyncCrossingSink) = {
     implicit val p = parameter
     if (params.useAXI4){
       val name = s"axi4wdogarray_${nextId()}"
       val crossing = LazyModule(new TLAsyncCrossingSink(AsyncQueueParams.singleton()))
+      val tlaxi4 = LazyModule(new TLToAXI4())
       val wdt = LazyModule(new AXI4WDT(params, pBus.beatBytes)(p))
       wdt.suggestName(name)
       pBus.toSlave(Some(name)) {
         wdt.node :=
         AXI4Buffer () :=
-        TLToAXI4 () :=
+        tlaxi4.node :=
         crossing.node :=
         TLAsyncCrossingSource() :=
         // toVariableWidthSlave doesn't use holdFirstDeny, which TLToAXI4() needsx
-        TLFragmenter(pBus.beatBytes, pBus.blockBytes, holdFirstDeny = true)
-        
+        TLFragmenter(pBus.beatBytes, pBus.blockBytes, holdFirstDeny = true) 
       }
       iBus.fromSync := IntSyncCrossingSink() := IntSyncCrossingSource(alreadyRegistered = true)  := wdt.intnode // Ibus -> Connecting to Interruptsystem
       
-      (Right(wdt),crossing)
+      (Right(wdt, tlaxi4),crossing)
     }else{
       val name = s"tlwdogarray_${nextId()}"
       val crossing = LazyModule(new TLAsyncCrossingSink(AsyncQueueParams.singleton()))
@@ -265,54 +219,4 @@ object TLWDT {
       (Left(wdt),crossing)
     }
   }
-
-  def attachTL(params: WDTParams, parameter: Parameters, pBus: PeripheryBus, iBus: InterruptBusWrapper): TLWDT = {
-    implicit val p = parameter
-    val name = s"tlwdogarray_${nextId()}"
-    val crossing = LazyModule(new TLAsyncCrossingSink(AsyncQueueParams.singleton()))
-    val wdt = LazyModule(new TLWDT(params, pBus.beatBytes)(p))
-    wdt.suggestName(name)
-    val node = wdt.node := crossing.node 
-    pBus.toVariableWidthSlave(Some(name)) { node := TLAsyncCrossingSource() }  // Pbus -> Connecting to PeripherialBus // sbus -> Systembus
-    iBus.fromSync := IntSyncCrossingSink() := IntSyncCrossingSource(alreadyRegistered = true)  := wdt.intnode // Ibus -> Connecting to Interruptsystem
-    
-    wdt
-    /*implicit val p = params.p
-    val name = s"i2c_${nextId()}"
-    val cbus = params.controlBus
-    val i2c = LazyModule(new TLI2C(cbus.beatBytes, params.i2c))
-    i2c.suggestName(name)
-
-    cbus.coupleTo(s"device_named_$name") {
-      i2c.controlXing(params.controlXType) := TLFragmenter(cbus.beatBytes, cbus.blockBytes) := _
-    }
-    params.intNode := i2c.intXing(params.intXType)
-    InModuleBody { i2c.module.clock := params.mclock.map(_.getWrappedValue).getOrElse(cbus.module.clock) }
-    InModuleBody { i2c.module.reset := params.mreset.map(_.getWrappedValue).getOrElse(cbus.module.reset) }
-
-    i2c*/
-  }
-
-  def attachAXI4(params: WDTParams, parameter: Parameters, pBus: PeripheryBus, iBus: InterruptBusWrapper): AXI4WDT = {
-    implicit val p = parameter
-    val name = s"axi4wdogarray_${nextId()}"
-    val crossing = LazyModule(new TLAsyncCrossingSink(AsyncQueueParams.singleton()))
-    val wdt = LazyModule(new AXI4WDT(params, pBus.beatBytes)(p))
-    wdt.suggestName(name)
-        pBus.toSlave(Some(name)) {
-          wdt.node :=
-          AXI4Buffer () :=
-          TLToAXI4 () :=
-          crossing.node :=
-          TLAsyncCrossingSource() :=
-          // toVariableWidthSlave doesn't use holdFirstDeny, which TLToAXI4() needsx
-          TLFragmenter(pBus.beatBytes, pBus.blockBytes, holdFirstDeny = true)
-          
-        }
-        iBus.fromSync := IntSyncCrossingSink() := IntSyncCrossingSource(alreadyRegistered = true)  := wdt.intnode // Ibus -> Connecting to Interruptsystem
-        
-        wdt
-  }
-
-
 }
