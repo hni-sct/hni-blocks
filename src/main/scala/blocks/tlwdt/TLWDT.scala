@@ -52,7 +52,7 @@ trait WDTModule extends HasRegMap
                     PRBS = c.PRBS, PRBS_Set = c.PRBS_Set, Key = c.Key, 
                     regWidth = c.regBytes*8, countWidth = c.countWidth, cmpWidth = c.cmpWidth))
     io.wdog.outputs := wdog.io.outputs
-    wdog.io.corerst := false.B  // has to be false or true???
+    wdog.io.corerst := false.B
     for(i<-0 until c.Ints){
       interrupts := wdog.io.interrupts
     }
